@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile the pipeline scripts
+        run: python3 -m py_compile skills/translate-book/scripts/*.py
+
+      - name: Validate plugin manifests
+        run: |
+          python3 - <<'PY'
+          import glob, json
+          for path in sorted(glob.glob(".claude-plugin/*.json")):
+              json.load(open(path, encoding="utf-8"))
+              print("ok", path)
+          PY
+
+      - name: Check SKILL.md frontmatter and script references
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          skill_dir = pathlib.Path("skills/translate-book")
+          text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+          if not text.startswith("---\n"):
+              sys.exit("SKILL.md must open with YAML frontmatter on line 1")
+          front = text.split("---", 2)[1]
+          for key in ("name:", "description:"):
+              if key not in front:
+                  sys.exit(f"SKILL.md frontmatter is missing `{key}`")
+          if "name: translate-book" not in front:
+              sys.exit("frontmatter `name` must match the skill directory name")
+
+          missing = [p for p in re.findall(r"scripts/[\w.]+\.py", text)
+                     if not (skill_dir / p).is_file()]
+          if missing:
+              sys.exit(f"SKILL.md references missing files: {missing}")
+          print("SKILL.md OK")
+          PY

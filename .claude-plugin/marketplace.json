@@ -1,0 +1,25 @@
+{
+  "name": "translate-book-skill",
+  "description": "Structure-preserving book translation for Claude Code and compatible agents.",
+  "owner": {
+    "name": "Abirdcfly",
+    "url": "https://github.com/Abirdcfly"
+  },
+  "plugins": [
+    {
+      "name": "translate-book",
+      "source": "./",
+      "description": "Translate an EPUB or PDF technical book into another language while preserving its structure, then rebuild a valid EPUB.",
+      "category": "productivity",
+      "tags": [
+        "translation",
+        "epub",
+        "pdf",
+        "ebook"
+      ],
+      "license": "MIT",
+      "repository": "https://github.com/Abirdcfly/translate-book-skill",
+      "homepage": "https://github.com/Abirdcfly/translate-book-skill"
+    }
+  ]
+}
