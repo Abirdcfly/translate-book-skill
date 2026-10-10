@@ -58,7 +58,7 @@ def overlay(tree, src):
             dst = os.path.join(tree, rel)
             candidates = [dst]
             # tolerate overlay dirs named like the tree's own subdirs
-            for sub in ("Text", "OEBPS/Text", "Styles", "OEBPS/Styles",
+            for sub in ("Text", "OEBPS/Text", "OEBPS", "Styles", "OEBPS/Styles",
                         "Images", "OEBPS/Images"):
                 candidates.append(os.path.join(tree, sub, f))
             target = next((c for c in candidates if os.path.exists(c)), dst)

@@ -18,6 +18,12 @@ jobs:
       - name: Byte-compile the pipeline scripts
         run: python3 -m py_compile skills/translate-book/scripts/*.py
 
+      - name: Install lxml
+        run: pip install lxml
+
+      - name: Run regression tests
+        run: python3 -m unittest discover -s tests -v
+
       - name: Validate plugin manifests
         run: |
           python3 - <<'PY'

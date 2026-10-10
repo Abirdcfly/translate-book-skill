@@ -20,19 +20,35 @@ Usage
   units.py write   <src_dir> <units_dir> <trans_dir> <out_dir> [--identity]
                    [--exceptions FILE]
   units.py batch   <units_dir> <batches_dir> [--words N]
-  units.py merge   <units_dir> <done_dir> <trans_dir>
+  units.py glossary <units_dir> [--out glossary.json] [--top N]
+  units.py claim   <batches_dir> <done_dir> --worker ID [--count N] [--words N]
+                   [--release ID] [--units-dir DIR]
+  units.py validate-batches <batches_dir> <done_dir> [--units-dir DIR] [--files FILE ...]
+  units.py complete <batches_dir> <run_dir> <done_dir> [--units-dir DIR]
+                    [--files FILE ...] [--worker ID]
+  units.py status  <batches_dir> <done_dir> [--units-dir DIR] [--files FILE ...]
+  units.py merge   <units_dir> <done_dir> <trans_dir> --batches-dir DIR
+  units.py sample  <units_dir> <trans_dir> [--per-chapter N] [--out FILE]
   units.py rekey   <batches_dir> <old_done_dir> <new_done_dir>
 
 trans_dir/<name>.json holds {"file":..., "segs":[{i, raw, tags, atoms, out}]}.
 batches_dir/<name>-bNN.json holds {"file":..., "units":[{key, src}]} where
 key is "<i>.text" | "<i>.callouts.<j>" | "<i>.rows.<r>.<c>".
+
+Dispatch is claim-based: a worker translates into its own run directory, and
+`complete` promotes a file into the book-level done directory only after the
+deterministic validator passes. A worker's own report is never the merge gate.
 """
 import argparse
+from collections import Counter
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sys
+import time
 
 from lxml import etree
 from lxml import html as LH
@@ -42,7 +58,7 @@ KEEP_INLINE = {"a", "em", "strong", "sup", "sub", "b", "i", "small", "mark"}
 # Inline elements preserved whole, content verbatim.
 #   code-like spans must be atoms, NOT "skip subtree" — skipping drops the
 #   entire surrounding paragraph, not just the code.
-ATOM_INLINE = {"code", "kbd", "samp", "var", "tt", "img"}
+ATOM_INLINE = {"code", "kbd", "samp", "var", "tt", "img", "math"}
 # Subtree entirely excluded from translation units.
 SKIP_SUBTREE = {"pre", "script", "style"}
 INLINE_SET = (KEEP_INLINE | ATOM_INLINE |
@@ -53,6 +69,8 @@ CLOSE_RE = re.compile(r"⟧/(\d+)⟦")
 ATOM_RE = re.compile(r"⟨(\d+)⟩")
 TAGNAME_RE = re.compile(r"<([A-Za-z][\w:.-]*)")
 TOKEN_SPLIT = re.compile(r"(⟧/?\d+⟦|⟨\d+⟩)")
+MARKER_RE = re.compile(r"⟧(?P<close>/)?(?P<index>\d+)⟦")
+MALFORMED_MARKER_RE = re.compile(r"(?:⟦/?\d+⟦|⟦/?\d+⟧|⟧/?\d+⟧)")
 
 # Kept only where a citation would otherwise be re-derived wrongly.
 CITATION_RE = re.compile(r"^\[[\d,\s–-]+\]$")
@@ -132,6 +150,11 @@ def iter_units(root):
         name = localname(el)
         if name in SKIP_SUBTREE or name in INLINE_SET:
             continue
+        # root.iter() descends into atoms and skipped subtrees. MathML <mtext>
+        # nodes are leaf elements, so without this guard they become prose units.
+        if any(localname(parent) in ATOM_INLINE or localname(parent) in SKIP_SUBTREE
+               for parent in el.iterancestors()):
+            continue
         if not is_leaf_block(el):
             continue
         r = seg_from_element(el)
@@ -144,8 +167,28 @@ def iter_units(root):
         i += 1
 
 
+def detect_encoding(data):
+    """Return an explicit encoding for XHTML that omits a charset declaration."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    declared = re.match(rb"^\s*<\?xml[^>]*encoding=[\"']([\w.-]+)[\"']", data[:200], re.I)
+    if not declared:
+        declared = re.search(rb"charset\s*=\s*[\"']?([\w.-]+)", data[:4096], re.I)
+    if declared:
+        return declared.group(1).decode("ascii", "replace")
+    try:
+        data.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "latin-1"
+
+
 def parse_file(path):
-    tree = LH.parse(path)
+    with open(path, "rb") as fh:
+        data = fh.read()
+    tree = LH.parse(io.BytesIO(data), LH.HTMLParser(encoding=detect_encoding(data)))
     return tree, tree.getroot()
 
 
@@ -204,25 +247,57 @@ def render_fragment(template, tags, atoms=None):
     return "".join(out)
 
 
-def validate(template, translated, n_atoms=0):
+def token_events(text):
+    return [(match.group("index"), bool(match.group("close")))
+            for match in MARKER_RE.finditer(text)]
+
+
+def validate(template, translated, tags=None, check_atoms=True):
     """Return None if the unit is safe to write, else a reason string.
 
     Fewer tokens than the source is allowed: a hyphenated English word split
     across two emphasis spans merges into one word in most target languages.
     """
-    wo, wc = sorted(OPEN_RE.findall(template)), sorted(CLOSE_RE.findall(template))
-    go, gc = sorted(OPEN_RE.findall(translated)), sorted(CLOSE_RE.findall(translated))
-    extra = [t for t in go if t not in wo] + [t for t in gc if t not in wc]
+    malformed = MALFORMED_MARKER_RE.search(translated)
+    if malformed:
+        return f"malformed marker glyph: {malformed.group(0)}"
+
+    source_events = Counter(token_events(template))
+    translated_events = Counter(token_events(translated))
+    extra = list((translated_events - source_events).elements())
     if extra:
-        return f"introduced tokens not in source: {extra}"
-    used = set(go) | set(gc)
-    unpaired = [t for t in used if (t in go) != (t in gc)]
-    if unpaired:
-        return f"unpaired tokens: {unpaired}"
-    if n_atoms:
-        wa, ga = sorted(ATOM_RE.findall(template)), sorted(ATOM_RE.findall(translated))
-        if wa != ga:
-            return f"atom mismatch: source={wa} translation={ga}"
+        return f"introduced or duplicated tokens: {extra}"
+
+    stack = []
+    for index, is_close in token_events(translated):
+        if is_close:
+            if not stack or stack[-1] != index:
+                return f"crossed or unopened token: {index}"
+            stack.pop()
+        else:
+            stack.append(index)
+    if stack:
+        return f"unclosed tokens: {stack}"
+
+    if tags:
+        link_indices = {
+            str(index) for index, tag in enumerate(tags)
+            if (match := TAGNAME_RE.match(tag)) and match.group(1).lower() == "a"
+        }
+        missing = []
+        for index in sorted(link_indices, key=int):
+            for event in ((index, False), (index, True)):
+                if translated_events[event] != source_events[event]:
+                    missing.append(index)
+                    break
+        if missing:
+            return f"dropped link tokens: {missing}"
+
+    if check_atoms:
+        source_atoms = Counter(ATOM_RE.findall(template))
+        translated_atoms = Counter(ATOM_RE.findall(translated))
+        if source_atoms != translated_atoms:
+            return f"atom mismatch: source={sorted(source_atoms.elements())} translation={sorted(translated_atoms.elements())}"
     return None
 
 
@@ -245,8 +320,8 @@ def write_file(src_path, dst_path, trans, exceptions=frozenset()):
         out = t.get("out")
         if not out or not out.strip():
             continue
-        n_atoms = 0 if (fname, i) in exceptions else len(t.get("atoms") or [])
-        reason = validate(t["raw"], out, n_atoms)
+        reason = validate(t["raw"], out, t.get("tags") or [],
+                          check_atoms=(fname, i) not in exceptions)
         if reason:
             failures.append((i, reason))
             continue                                 # keep source text
@@ -301,6 +376,8 @@ def cmd_write(args):
             print(f"   {fn} seg {i}: {r}")
     else:
         print("all units passed validation")
+    if all_fail and args.strict:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------- batching
@@ -347,10 +424,13 @@ def cmd_batch(args):
                 cur, cw = [], 0
             cur.append({"key": key, "src": src}); cw += w
         bi = _flush(cur, cw, bi, stem, d, args.batches_dir, plan)
-    json.dump(plan, open(os.path.join(args.batches_dir, "_plan.json"), "w",
-                         encoding="utf-8"), ensure_ascii=False, indent=1)
+    digest = plan_digest(args.batches_dir, plan)
+    json.dump({"hash": digest, "batches": plan},
+              open(os.path.join(args.batches_dir, "_plan.json"), "w",
+                   encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"{len(plan)} batches  {sum(p['units'] for p in plan)} units  "
           f"{sum(p['words'] for p in plan)} words -> {args.batches_dir}")
+    print(f"plan hash {digest}")
 
 
 def _flush(cur, cw, bi, stem, d, out_dir, plan):
@@ -365,12 +445,302 @@ def _flush(cur, cw, bi, stem, d, out_dir, plan):
     return bi + 1
 
 
+def plan_digest(batches_dir, entries):
+    """Fingerprint the plan by its actual unit keys and source text.
+
+    Re-extracting or re-batching changes the digest, which is how `status`
+    detects promoted outputs that were produced against an older plan.
+    """
+    h = hashlib.sha256()
+    for entry in entries:
+        h.update(f"{entry.get('file')}\x00{entry.get('batch')}\x00".encode("utf-8"))
+        path = os.path.join(batches_dir, entry["file"])
+        if not os.path.exists(path):
+            continue
+        data = json.load(open(path, encoding="utf-8"))
+        for unit in data.get("units", []):
+            h.update(f"{unit.get('key')}\x00{unit.get('src')}\x00".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def load_plan(batches_dir):
+    """Return (entries, hash). Accepts the older bare-list plan format.
+
+    A plan written without a digest gets one computed here, so staleness
+    detection works no matter which version of `batch` produced the plan.
+    """
+    data = json.load(open(os.path.join(batches_dir, "_plan.json"), encoding="utf-8"))
+    if isinstance(data, dict):
+        entries, digest = data.get("batches", []), data.get("hash")
+    else:
+        entries, digest = data, None
+    return entries, digest or plan_digest(batches_dir, entries)
+
+
+def read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+
+def load_claims(batches_dir):
+    return read_json(os.path.join(batches_dir, "_claims.json"), {})
+
+
+def load_state(done_dir):
+    return read_json(os.path.join(done_dir, "_state.json"),
+                     {"plan_hash": None, "promoted": {}})
+
+
+def unit_metadata(units_dir):
+    """Return (source-file, batch-key) -> extraction metadata for validation."""
+    metadata = {}
+    if not units_dir:
+        return metadata
+    for name in sorted(os.listdir(units_dir)):
+        if not name.endswith(".json") or name.startswith("_"):
+            continue
+        data = json.load(open(os.path.join(units_dir, name), encoding="utf-8"))
+        for segment in data.get("segs", []):
+            metadata[(data["file"], f"{segment['i']}.text")] = segment
+    return metadata
+
+
+def validate_batch_output(expected_path, output_path, metadata):
+    """Return a list of user-actionable errors for one worker output file."""
+    name = os.path.basename(expected_path)
+    if not os.path.exists(output_path):
+        return [f"{name}: MISSING"]
+    try:
+        expected = json.load(open(expected_path, encoding="utf-8"))
+        actual = json.load(open(output_path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{name}: invalid JSON: {exc}"]
+
+    if actual.get("file") != expected.get("file") or actual.get("batch") != expected.get("batch"):
+        return [f"{name}: file or batch metadata changed"]
+    source_units = expected.get("units", [])
+    translated_units = actual.get("units", [])
+    if len(source_units) != len(translated_units):
+        return [f"{name}: unit count {len(translated_units)} != expected {len(source_units)}"]
+
+    errors = []
+    for position, (source, translated) in enumerate(zip(source_units, translated_units)):
+        key = source.get("key")
+        if translated.get("key") != key or translated.get("src") != source.get("src"):
+            errors.append(f"{name}: unit {position} key/src changed")
+            continue
+        output = translated.get("out")
+        if not isinstance(output, str) or not output.strip():
+            errors.append(f"{name}: {key}: empty out")
+            continue
+        segment = metadata.get((expected.get("file"), key), {})
+        reason = validate(source["src"], output, segment.get("tags"))
+        if reason:
+            errors.append(f"{name}: {key}: {reason}")
+    return errors
+
+
+def batch_states(batches_dir, done_dir, units_dir=None, selected=None):
+    """Return (states, errors, expected_files).
+
+    states[name] is "complete" | "missing" | "invalid" — the base for claim,
+    status and complete. One classification, so the three cannot disagree.
+    """
+    plan, _ = load_plan(batches_dir)
+    expected_files = [entry["file"] for entry in plan]
+    if selected:
+        unknown = sorted(set(selected) - set(expected_files))
+        errors = [f"unknown planned batch: {name}" for name in unknown]
+        expected_files = [name for name in expected_files if name in set(selected)]
+    else:
+        errors = []
+        actual_files = ({name for name in os.listdir(done_dir) if name.endswith(".json")
+                         and not name.startswith("_")}
+                        if os.path.isdir(done_dir) else set())
+        extras = sorted(actual_files - set(expected_files))
+        errors.extend(f"unexpected worker output: {name}" for name in extras)
+
+    metadata = unit_metadata(units_dir)
+    states = {}
+    for name in expected_files:
+        file_errors = validate_batch_output(
+            os.path.join(batches_dir, name), os.path.join(done_dir, name), metadata)
+        if not file_errors:
+            states[name] = "complete"
+        elif len(file_errors) == 1 and file_errors[0].endswith(": MISSING"):
+            states[name] = "missing"
+        else:
+            states[name] = "invalid"
+        errors.extend(file_errors)
+    return states, errors, expected_files
+
+
+def validate_batch_outputs(batches_dir, done_dir, units_dir=None, selected=None):
+    """Validate planned worker outputs and return (errors, expected_files)."""
+    _states, errors, expected_files = batch_states(
+        batches_dir, done_dir, units_dir, selected)
+    return errors, expected_files
+
+
+def promote_file(src, dst_dir, name):
+    """Copy one validated output into the book-level done dir, atomically."""
+    os.makedirs(dst_dir, exist_ok=True)
+    tmp = os.path.join(dst_dir, f".{name}.{os.getpid()}.tmp")
+    shutil.copy(src, tmp)
+    os.replace(tmp, os.path.join(dst_dir, name))
+
+
+def cmd_claim(args):
+    """Hand out unclaimed pending batches so two workers never overlap."""
+    plan, _ = load_plan(args.batches_dir)
+    claims = load_claims(args.batches_dir)
+    if args.release:
+        freed = [name for name, c in claims.items() if c.get("worker") == args.release]
+        for name in freed:
+            del claims[name]
+        if freed:
+            print(f"released {len(freed)} batch(es) claimed by {args.release}")
+
+    states, _errors, expected = batch_states(
+        args.batches_dir, args.done_dir, args.units_dir)
+    pending = [name for name in expected
+               if states[name] != "complete"
+               and claims.get(name, {}).get("worker") in (None, args.worker)]
+
+    chosen, words = [], 0
+    for name in pending:
+        if args.count and len(chosen) >= args.count:
+            break
+        if chosen and args.words and words + _planned_words(plan, name) > args.words:
+            break
+        chosen.append(name)
+        words += _planned_words(plan, name)
+    for name in chosen:
+        claims[name] = {"worker": args.worker, "at": time.time()}
+    write_json(os.path.join(args.batches_dir, "_claims.json"), claims)
+
+    print(f"worker={args.worker} claimed={len(chosen)} "
+          f"pending={len(pending) - len(chosen)}")
+    for name in chosen:
+        print(f"   {name}")
+
+
+def _planned_words(plan, name):
+    for entry in plan:
+        if entry.get("file") == name:
+            return entry.get("words", 0)
+    return 0
+
+
+def cmd_complete(args):
+    """Validate a worker's run directory, then promote only the files that pass."""
+    _plan, plan_hash = load_plan(args.batches_dir)
+    if args.files:
+        selected = list(args.files)
+    else:
+        present = ({name for name in os.listdir(args.run_dir)
+                    if name.endswith(".json") and not name.startswith("_")}
+                   if os.path.isdir(args.run_dir) else set())
+        _states, _errors, expected = batch_states(args.batches_dir, args.run_dir)
+        selected = [name for name in expected if name in present]
+        if not selected:
+            print(f"nothing to promote: no planned batch output in {args.run_dir}")
+            raise SystemExit(1)
+
+    states, errors, expected = batch_states(
+        args.batches_dir, args.run_dir, args.units_dir, selected)
+
+    promoted, rejected = [], []
+    for name in expected:
+        if states[name] == "complete":
+            promote_file(os.path.join(args.run_dir, name), args.done_dir, name)
+            promoted.append(name)
+        else:
+            rejected.append(name)
+
+    state = load_state(args.done_dir)
+    stale = 0
+    if promoted and state.get("plan_hash") != plan_hash:
+        stale = len(state.get("promoted", {}))
+        state["promoted"] = {}
+    state["plan_hash"] = plan_hash
+    for name in promoted:
+        state.setdefault("promoted", {})[name] = {"worker": args.worker,
+                                                  "at": time.time()}
+    write_json(os.path.join(args.done_dir, "_state.json"), state)
+
+    claims = load_claims(args.batches_dir)
+    for name in promoted:
+        claims.pop(name, None)
+    write_json(os.path.join(args.batches_dir, "_claims.json"), claims)
+
+    print(f"promoted {len(promoted)} batch(es) -> {args.done_dir}"
+          + (f"  (replacing {stale} stale output(s))" if stale else ""))
+    if rejected:
+        print(f"REJECTED {len(rejected)} batch(es):")
+        for error in errors:
+            print(f"   {error}")
+        raise SystemExit(1)
+
+
+def cmd_validate_batches(args):
+    errors, expected = validate_batch_outputs(
+        args.batches_dir, args.done_dir, args.units_dir, args.files)
+    if errors:
+        print(f"INVALID {len(errors)} issue(s) across {len(expected)} planned batch(es):")
+        for error in errors:
+            print(f"   {error}")
+        raise SystemExit(1)
+    print(f"OK {len(expected)} planned batch(es) validated")
+
+
+def cmd_status(args):
+    """One line of truth for a run: what is done, what is missing, what is claimed."""
+    _plan, plan_hash = load_plan(args.batches_dir)
+    states, errors, expected = batch_states(
+        args.batches_dir, args.done_dir, args.units_dir, args.files)
+    claims = load_claims(args.batches_dir)
+    state = load_state(args.done_dir)
+    counts = Counter(states.values())
+    stale = (bool(state.get("promoted")) and bool(state.get("plan_hash"))
+             and state["plan_hash"] != plan_hash)
+    print(f"planned={len(expected)} complete={counts['complete']} "
+          f"missing={counts['missing']} invalid={counts['invalid']} "
+          f"claimed={len(claims)} stale={len(state.get('promoted', {})) if stale else 0}")
+    for error in errors:
+        print(f"   {error}")
+    if stale:
+        print("   stale: outputs were promoted against an older plan — re-run the "
+              "affected batches (rekey first if the extraction changed)")
+    if counts["missing"] or counts["invalid"] or stale or any(
+            error.startswith("unknown planned batch") or
+            error.startswith("unexpected worker output") for error in errors):
+        raise SystemExit(1)
+
+
 def cmd_merge(args):
-    """Fold finished batch outputs into per-chapter translation files."""
+    """Fold only validated, planned batch outputs into per-chapter files."""
+    errors, expected_files = validate_batch_outputs(
+        args.batches_dir, args.done_dir, args.units_dir)
+    if errors and not args.allow_incomplete:
+        print("merge refused: validate batches first")
+        for error in errors:
+            print(f"   {error}")
+        raise SystemExit(1)
     os.makedirs(args.trans_dir, exist_ok=True)
     groups = {}
-    for f in sorted(os.listdir(args.done_dir)):
-        if not f.endswith(".json"):
+    for f in expected_files:
+        if not os.path.exists(os.path.join(args.done_dir, f)):
             continue
         stem = re.sub(r"-b\d+\.json$", "", f)
         groups.setdefault(stem, []).append(f)
@@ -393,6 +763,109 @@ def cmd_merge(args):
                   open(os.path.join(args.trans_dir, stem + ".json"), "w",
                        encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"merged {len(groups)} chapters -> {args.trans_dir}")
+
+
+CJK_RE = re.compile(r"[㐀-䶿一-鿿]")
+XREF_RE = re.compile(
+    r"\b(figure|fig\.|table|chapter|section|listing|appendix|equation)\s*[\d.]+", re.I)
+ASCII_RUN_RE = re.compile(r"(?:\b[A-Za-z]{2,}\b[\s,.;:()\-–]*){4,}")
+PHRASE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b")
+TECH_RE = (re.compile(r"\b[A-Z][A-Z0-9]{1,}(?:-[A-Z0-9]+)*\b"),   # PSO, API
+           re.compile(r"\b[A-Z][a-z]+[A-Z][A-Za-z]*\b"),          # CamelCase
+           re.compile(r"\b[a-zA-Z_]\w*(?:[.:][a-zA-Z_]\w*)+\b"))  # json.loads
+
+
+def plain_text(raw):
+    """Source text with markers removed, for term mining."""
+    return ATOM_RE.sub(" ", OPEN_RE.sub(" ", CLOSE_RE.sub(" ", raw)))
+
+
+def sample_units(segs, trans, per_chapter):
+    """Deterministic per-chapter sample: long prose, short headings, xrefs, markers."""
+    by_len = sorted(segs, key=lambda s: -len(s["raw"]))
+    longs = [s for s in by_len if len(s["raw"]) >= 120][:2] or by_len[:2]
+    picks = [(s, "long") for s in longs]
+    for kind, pred in (("token", lambda s: "⟧" in s["raw"]),
+                       ("atom", lambda s: "⟨" in s["raw"]),
+                       ("xref", lambda s: XREF_RE.search(s["raw"])),
+                       ("short", lambda s: len(s["raw"]) <= 60)):
+        found = next((s for s in segs if pred(s)), None)
+        if found is not None:
+            picks.append((found, kind))
+
+    entries, seen = [], set()
+    for seg, kind in picks:
+        if seg["i"] in seen:
+            continue
+        seen.add(seg["i"])
+        out = (trans.get(seg["i"], {}).get("out") or "").strip()
+        flags = []
+        if not out:
+            flags.append("empty")
+        else:
+            if out == seg["raw"]:
+                flags.append("untranslated")
+            reason = validate(seg["raw"], out, seg.get("tags") or [])
+            if reason:
+                flags.append(f"invalid: {reason}")
+            if not CJK_RE.search(out):
+                flags.append("no-cjk")
+            if ASCII_RUN_RE.search(out):
+                flags.append("english-leftover")
+        entries.append({"i": seg["i"], "kind": kind, "src": seg["raw"],
+                        "out": out, "flags": flags})
+        if len(entries) >= per_chapter:
+            break
+    return entries
+
+
+def cmd_sample(args):
+    """Fixed-size review sample per chapter — a checklist, not a quality judgement."""
+    chapters, flagged = [], 0
+    print("sampled units for review")
+    for name in sorted(os.listdir(args.units_dir)):
+        if not name.endswith(".json") or name.startswith("_"):
+            continue
+        data = json.load(open(os.path.join(args.units_dir, name), encoding="utf-8"))
+        trans = load_trans_file(os.path.join(args.trans_dir, name))
+        entries = sample_units(data.get("segs", []), trans, args.per_chapter)
+        n = sum(1 for e in entries if e["flags"])
+        flagged += n
+        chapters.append({"file": data.get("file", name), "entries": entries})
+        print(f"   {data.get('file', name):40s} sampled={len(entries):2d} flagged={n:2d}")
+        for e in entries:
+            if e["flags"]:
+                print(f"      [{e['i']} {e['kind']}] {','.join(e['flags'])}: "
+                      f"{e['src'][:60]}")
+    report = {"chapters": chapters}
+    if args.out:
+        write_json(args.out, report)
+        print(f"wrote {args.out}")
+    print(f"{len(chapters)} chapters  "
+          f"{sum(len(c['entries']) for c in chapters)} units sampled  {flagged} flagged")
+
+
+def cmd_glossary(args):
+    """Seed a book-level glossary so parallel batches share one terminology."""
+    phrases, technical = Counter(), Counter()
+    for name in sorted(os.listdir(args.units_dir)):
+        if not name.endswith(".json") or name.startswith("_"):
+            continue
+        data = json.load(open(os.path.join(args.units_dir, name), encoding="utf-8"))
+        for seg in data.get("segs", []):
+            text = plain_text(seg["raw"])
+            for m in PHRASE_RE.finditer(text):
+                phrases[m.group(0)] += 1
+            for rx in TECH_RE:
+                for m in rx.finditer(text):
+                    technical[m.group(0)] += 1
+    terms = [t for t, _ in phrases.most_common(args.top)]
+    never = [t for t, _ in technical.most_common(args.top)]
+    payload = {"terms": {t: "" for t in terms}, "never_translate": never,
+               "counts": {**phrases, **technical}}
+    write_json(args.out, payload)
+    print(f"seeded {len(terms)} terms, {len(never)} never-translate entries -> {args.out}")
+    print("fill in the empty values, then point every worker at this file")
 
 
 def cmd_rekey(args):
@@ -447,6 +920,8 @@ def main():
     p.add_argument("trans_dir"); p.add_argument("out_dir")
     p.add_argument("--identity", action="store_true",
                    help="re-inject source text (self-test, needs no trans_dir)")
+    p.add_argument("--strict", action="store_true",
+                   help="exit non-zero if any unit was rejected")
     p.add_argument("--exceptions", help="JSON list of {file, seg} allowed to differ")
     p.set_defaults(func=cmd_write)
 
@@ -455,9 +930,52 @@ def main():
     p.add_argument("--words", type=int, default=1600)
     p.set_defaults(func=cmd_batch)
 
+    p = sub.add_parser("glossary")
+    p.add_argument("units_dir")
+    p.add_argument("--out", default="glossary.json")
+    p.add_argument("--top", type=int, default=60)
+    p.set_defaults(func=cmd_glossary)
+
+    p = sub.add_parser("claim")
+    p.add_argument("batches_dir"); p.add_argument("done_dir")
+    p.add_argument("--worker", required=True)
+    p.add_argument("--count", type=int, default=6)
+    p.add_argument("--words", type=int, default=0, help="stop after this many words")
+    p.add_argument("--release", help="release another worker's claims first")
+    p.add_argument("--units-dir")
+    p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("validate-batches")
+    p.add_argument("batches_dir"); p.add_argument("done_dir")
+    p.add_argument("--units-dir")
+    p.add_argument("--files", nargs="*")
+    p.set_defaults(func=cmd_validate_batches)
+
+    p = sub.add_parser("complete")
+    p.add_argument("batches_dir"); p.add_argument("run_dir"); p.add_argument("done_dir")
+    p.add_argument("--units-dir")
+    p.add_argument("--files", nargs="*")
+    p.add_argument("--worker")
+    p.set_defaults(func=cmd_complete)
+
+    p = sub.add_parser("status")
+    p.add_argument("batches_dir"); p.add_argument("done_dir")
+    p.add_argument("--units-dir")
+    p.add_argument("--files", nargs="*")
+    p.set_defaults(func=cmd_status)
+
     p = sub.add_parser("merge")
     p.add_argument("units_dir"); p.add_argument("done_dir"); p.add_argument("trans_dir")
+    p.add_argument("--batches-dir", required=True)
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="merge completed files but keep source text for missing batches")
     p.set_defaults(func=cmd_merge)
+
+    p = sub.add_parser("sample")
+    p.add_argument("units_dir"); p.add_argument("trans_dir")
+    p.add_argument("--per-chapter", type=int, default=6)
+    p.add_argument("--out", help="write the review sheet as JSON here")
+    p.set_defaults(func=cmd_sample)
 
     p = sub.add_parser("rekey")
     p.add_argument("batches_dir"); p.add_argument("old_done_dir"); p.add_argument("new_done_dir")

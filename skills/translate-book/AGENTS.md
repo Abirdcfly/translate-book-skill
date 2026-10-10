@@ -14,10 +14,12 @@ Translate the assigned batches of <BOOK TITLE> into <TARGET LANGUAGE>.
 
 ## Paths
 - Input:  <batches_dir>
-- Output: <done_dir>   (create if missing)
+- Output: <run_dir>   (create if missing; a private directory for this worker)
+- Glossary: <glossary.json>   (same file for every worker — use its terms verbatim)
+- Register: <style.md>   (one or two sentences on this book's voice)
 
 ## Your batches (<N> files)
-<file list, one per line>
+<file list from `units.py claim` — do not invent or expand this list>
 
 ## Input format
 {"file": "<chapter>.json", "batch": <n>,
@@ -39,6 +41,10 @@ between them; keep both markers. Sample:
   src: `see ⟧0⟦chapter 6⟧/0⟦ for the derivation`
   out: `参见⟧0⟦第 6 章⟧/0⟦的推导`
 
+An **empty** pair `⟧0⟦⟧/0⟦` is an anchor with no visible text — usually an
+index target. Copy it unchanged and in place. Every link token is mandatory;
+dropping it rejects the unit.
+
 ### Atoms: ⟨n⟩
 An inseparable inline element — `<code>json.loads</code>`, an inline icon.
 Rules: the multiset of atoms must be identical to the source. Reposition them
@@ -51,6 +57,10 @@ If a token or atom has no natural place in your sentence, place it at the
 closest position that preserves meaning. Never drop one to make a sentence flow.
 
 ## Terminology
+- <glossary.json> is authoritative. Use its `terms` verbatim; entries in
+  `never_translate` stay in the source language, untouched, in every batch.
+- If a term is missing from the glossary, translate it consistently and report it
+  so the glossary can be extended for the following batches.
 - Use the target-language term on first occurrence with the source term and
   abbreviation in parentheses, then either alone: 粒子群优化（particle swarm
   optimization, PSO）.
@@ -76,33 +86,29 @@ ellipsis is fine; keep the sense of someone explaining.
 - Source fragments that are visibly incomplete (a missing inline formula leaves
   a gap, e.g. `based on a given .`) — preserve the gap. Do not invent content.
 
-## JSON safety — read this twice
-Never emit a raw ASCII double quote `"` inside a translation. Use typographic
-quotes “ ”. A single unescaped `"` makes the file unparseable and the batch is lost.
+## JSON safety
+Write valid JSON with a serializer. Straight quotes are allowed in translated
+prose only when correctly JSON-escaped; never hand-write an unescaped `"`.
 
 Modify **only** the `out` field. Never touch `key` or `src`.
 
 ## Self-check before reporting
-Run this and confirm every line prints OK:
+Run the deterministic validator against your own run directory and paste its
+output verbatim:
 
-    python3 -c "
-    import json
-    for f in ['<file1>', '<file2>']:
-        a = json.load(open('<batches_dir>/' + f))['units']
-        b = json.load(open('<done_dir>/' + f))['units']
-        same  = len(a) == len(b) and all(
-            x['key'] == y['key'] and x['src'] == y['src'] for x, y in zip(a, b))
-        empty = [y for y in b if not y.get('out', '').strip()]
-        print(f, len(b), 'OK' if same and not empty else
-              f'MISMATCH={not same} EMPTY={len(empty)}')
-    "
+    python3 <skill>/scripts/units.py validate-batches <batches_dir> <run_dir> \
+      --units-dir <units_dir> --files <file1> <file2>
 
-Also confirm, per unit: atom count matches the source, and no English prose is
-left in `out`.
+It checks identity, non-empty output, marker syntax/nesting, atoms, and link
+anchors. Your files are promoted with `complete`, which re-runs this check —
+a batch that fails is not merged, so fix it here rather than reporting around it.
+Do not claim “no English prose” from a regex; flag retained English for human
+review when it is not code, an identifier, a name, a quotation, or a title.
 
 ## Report
 List the files handled, unit and word counts, and the self-check output. Flag any
-unit you could not translate cleanly rather than leaving it silently blank.
+unit you could not translate cleanly rather than leaving it silently blank, and
+list any term you had to decide yourself so the glossary can absorb it.
 ```
 
 ---
@@ -111,7 +117,12 @@ unit you could not translate cleanly rather than leaving it silently blank.
 
 **Chapter coherence beats even load.** A run that spans a whole chapter keeps its
 terminology self-consistent; a perfectly balanced split across chapters does not.
-Balance to roughly 15–20k words per run.
+Balance to roughly 15–20k words per run (`claim --count 8 --words 20000`).
+
+**Never point two workers at the same file.** Claims exist because "the subtask
+reported success but wrote nothing" is the most common failure — take the list
+from `claim`, and release a dead worker's claims with `--release` before
+re-dispatching.
 
 **Ask for the failures.** The final line matters: without it, unparseable units
 get skipped silently and surface only at verification.

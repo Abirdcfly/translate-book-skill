@@ -45,17 +45,21 @@ missing translation shows up in verification, corrupted markup does not.
 | Step | Command | What it does |
 |---|---|---|
 | 1. Extract | `units.py extract` | one JSON per chapter of units |
-| 2. Self-test | `units.py write --identity` | write the source text back, diff — catches every index-alignment bug in minutes |
-| 3. Batch | `units.py batch` | ~1600-word chunks sized for a subagent |
-| 4. Translate | [`AGENTS.md`](skills/translate-book/AGENTS.md) prompt | one subagent per batch, output adds an `out` field |
-| 5. Merge | `units.py merge` | fold finished batches into per-chapter files |
-| 6. Write back | `units.py write` | re-inject translations into the structure, validate per unit |
-| 7. Package | `epub_build.py` | stage a copy, overlay, zip a conformant EPUB |
-| 8. Verify | `epub_verify.py` | structure diff, coverage, untranslated-unit report |
+| 2. Self-test | `units.py write --identity --strict` | write the source text back, diff — catches every index-alignment bug in minutes |
+| 3. Batch | `units.py batch` | ~1600-word chunks, plus a `_plan.json` hashed over every planned unit |
+| 4. Glossary | `units.py glossary` | seed `glossary.json` so parallel batches share one terminology |
+| 5. Dispatch | `units.py claim` | hand a worker an unclaimed slice; it writes into its own run directory |
+| 6. Promote | `units.py complete` | validate the run directory, then atomically copy only the files that pass |
+| 7. Merge | `units.py merge` | fold finished batches into per-chapter files; refuses an incomplete plan |
+| 8. Write back | `units.py write` | re-inject translations into the structure, validate per unit |
+| 9. Package | `epub_build.py` | stage a copy, overlay, zip a conformant EPUB |
+| 10. Verify | `epub_verify.py` | structure diff, coverage, untranslated-unit report |
+| 11. Sample | `units.py sample` | fixed-size review sample per chapter, flags empty/untranslated units |
 
-Steps 6–8 are free to re-run. Re-running step 1 invalidates existing translations,
+Steps 8–11 are free to re-run. Re-running step 1 invalidates existing translations,
 which is why `units.py rekey` exists — it re-matches by source text and typically
-recovers 95%+ of prior work.
+recovers 95%+ of prior work. `units.py status` is the single source of truth for
+what is done, missing, invalid, claimed, or stale.
 
 ## Install
 
@@ -108,23 +112,32 @@ SRC=work/src/OEBPS/Text
 # 1. Extract one JSON of units per chapter
 python3 scripts/units.py extract $SRC work/units
 
-# 2. Self-test BEFORE translating: write source text back and diff
-python3 scripts/units.py write $SRC work/units work/trans work/out --identity
+# 2. Self-test BEFORE translating: write source text back and diff (must exit 0)
+python3 scripts/units.py write $SRC work/units work/trans work/out --identity --strict
 diff -r $SRC work/out
 
-# 3. Batch for subagents
+# 3. Batch for subagents — _plan.json carries a hash of every planned unit
 python3 scripts/units.py batch work/units work/batches
 
-# 4. Translate — dispatch subagents with AGENTS.md, one output file per batch,
-#    written into work/done/ with the same filename and an added "out" field
+# 4. Seed the glossary, fill in the empty values, then dispatch. Each worker gets
+#    its own run directory; nothing is written straight into work/done.
+python3 scripts/units.py glossary work/units --out work/glossary.json
+python3 scripts/units.py claim work/batches work/done --worker w1 --count 6
 
-# 5. Fold finished batches into per-chapter translations
-python3 scripts/units.py merge work/units work/done work/trans
+# 5. Promote a worker's output only after it validates
+python3 scripts/units.py complete work/batches work/run/w1 work/done --units-dir work/units
+python3 scripts/units.py status work/batches work/done --units-dir work/units
 
-# 6. Write translations back into the structure (per-unit validation)
+# 6. Fold finished batches into per-chapter translations
+python3 scripts/units.py merge work/units work/done work/trans --batches-dir work/batches
+
+# 7. Write translations back into the structure (per-unit validation)
 python3 scripts/units.py write $SRC work/units work/trans work/out
 
-# 7. Package and verify
+# 8. Review a fixed sample per chapter before packaging
+python3 scripts/units.py sample work/units work/trans --out work/sample.json
+
+# 9. Package and verify
 python3 scripts/epub_build.py book.zh.epub --from work/src --overlay work/out
 python3 scripts/epub_verify.py book.zh.epub --source book.epub
 ```
@@ -196,7 +209,9 @@ that says what is missing:
 │       ├── REFERENCE.md      # unit model, failure catalogue, PDF recovery
 │       ├── AGENTS.md         # subagent prompt template, fill in the <slots>
 │       └── scripts/
-│           ├── units.py          # extract / write / batch / merge / rekey
+│           ├── units.py          # extract / write / batch / glossary / claim
+│           │                     # / validate-batches / complete / status
+│           │                     # / merge / sample / rekey
 │           ├── pdf_layout.py     # PDF → structured blocks (coordinates + fonts)
 │           ├── epub_build.py     # stage + package a valid EPUB
 │           └── epub_verify.py    # integrity, coverage, structure diff

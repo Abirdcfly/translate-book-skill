@@ -32,15 +32,18 @@
 | 步骤 | 命令 | 作用 |
 |---|---|---|
 | 1. 提取 | `units.py extract` | 每章一个 JSON，装的是单元 |
-| 2. 自检 | `units.py write --identity` | 把原文原样写回再 diff——几分钟内抓出所有索引错位 |
-| 3. 分批 | `units.py batch` | 切成约 1600 词的批次，正好交给一个子代理 |
-| 4. 翻译 | [`AGENTS.md`](skills/translate-book/AGENTS.md) 提示词 | 每批一个子代理，输出只增加一个 `out` 字段 |
-| 5. 合并 | `units.py merge` | 把已完成的批次折叠成每章一个文件 |
-| 6. 写回 | `units.py write` | 把译文写回结构，逐单元校验 |
-| 7. 打包 | `epub_build.py` | 复制一份再覆盖，打成合规 EPUB |
-| 8. 验证 | `epub_verify.py` | 结构对比、覆盖率、未翻译清单 |
+| 2. 自检 | `units.py write --identity --strict` | 把原文原样写回再 diff——几分钟内抓出所有索引错位 |
+| 3. 分批 | `units.py batch` | 切成约 1600 词的批次，并写出带 hash 的 `_plan.json` |
+| 4. 术语表 | `units.py glossary` | 生成 `glossary.json` 种子，让并行批次共用一套术语 |
+| 5. 派发 | `units.py claim` | 给子代理一段未认领的批次，它只写自己的 run 目录 |
+| 6. 提升 | `units.py complete` | 校验 run 目录，只把通过的批次原子复制进 `done` |
+| 7. 合并 | `units.py merge` | 把已完成的批次折叠成每章一个文件；计划不完整就拒绝 |
+| 8. 写回 | `units.py write` | 把译文写回结构，逐单元校验 |
+| 9. 打包 | `epub_build.py` | 复制一份再覆盖，打成合规 EPUB |
+| 10. 验证 | `epub_verify.py` | 结构对比、覆盖率、未翻译清单 |
+| 11. 抽检 | `units.py sample` | 每章固定抽若干单元，标出空译、漏译、标记损坏 |
 
-第 6–8 步可以反复重跑。重跑第 1 步会让已有译文全部失效，所以才有 `units.py rekey`：它按原文文本重新匹配，通常能救回 95% 以上的旧译文。
+第 8–11 步可以反复重跑。重跑第 1 步会让已有译文全部失效，所以才有 `units.py rekey`：它按原文文本重新匹配，通常能救回 95% 以上的旧译文。`units.py status` 是唯一的事实来源：哪些已完成、缺失、无效、被认领、已过期，一眼看全。
 
 ## 安装
 
@@ -89,23 +92,32 @@ SRC=work/src/OEBPS/Text
 # 1. 提取：每章一个单元 JSON
 python3 scripts/units.py extract $SRC work/units
 
-# 2. 翻译之前先自检：把原文原样写回再 diff
-python3 scripts/units.py write $SRC work/units work/trans work/out --identity
+# 2. 翻译之前先自检：把原文原样写回再 diff（必须退出码为 0）
+python3 scripts/units.py write $SRC work/units work/trans work/out --identity --strict
 diff -r $SRC work/out
 
-# 3. 分批交给子代理
+# 3. 分批交给子代理：_plan.json 里带着所有计划单元的 hash
 python3 scripts/units.py batch work/units work/batches
 
-# 4. 翻译：按 AGENTS.md 派发子代理，每个批次一个输出文件，
-#    写进 work/done/，文件名不变，只增加 "out" 字段
+# 4. 先生成术语表种子，填好空值再派发。每个子代理只写自己的 run 目录，
+#    谁都不直接往 work/done 里写。
+python3 scripts/units.py glossary work/units --out work/glossary.json
+python3 scripts/units.py claim work/batches work/done --worker w1 --count 6
 
-# 5. 把完成的批次折叠成每章译文
-python3 scripts/units.py merge work/units work/done work/trans
+# 5. 校验通过之后才把子代理的产物提升进 done
+python3 scripts/units.py complete work/batches work/run/w1 work/done --units-dir work/units
+python3 scripts/units.py status work/batches work/done --units-dir work/units
 
-# 6. 写回结构（逐单元校验）
+# 6. 把完成的批次折叠成每章译文
+python3 scripts/units.py merge work/units work/done work/trans --batches-dir work/batches
+
+# 7. 写回结构（逐单元校验）
 python3 scripts/units.py write $SRC work/units work/trans work/out
 
-# 7. 打包并验证
+# 8. 打包之前，先看一遍每章的固定抽检
+python3 scripts/units.py sample work/units work/trans --out work/sample.json
+
+# 9. 打包并验证
 python3 scripts/epub_build.py book.zh.epub --from work/src --overlay work/out
 python3 scripts/epub_verify.py book.zh.epub --source book.epub
 ```
@@ -162,7 +174,9 @@ python3 scripts/units.py extract work/tree/OEBPS/Text work/units
 │       ├── REFERENCE.md      # 单元模型、失败目录、PDF 结构恢复
 │       ├── AGENTS.md         # 子代理提示词模板，填掉里面的 <槽位>
 │       └── scripts/
-│           ├── units.py          # extract / write / batch / merge / rekey
+│           ├── units.py          # extract / write / batch / glossary / claim
+│           │                     # / validate-batches / complete / status
+│           │                     # / merge / sample / rekey
 │           ├── pdf_layout.py     # PDF → 结构化块（坐标 + 字体）
 │           ├── epub_build.py     # 暂存 + 打包成合法 EPUB
 │           └── epub_verify.py    # 完整性、覆盖率、结构对比

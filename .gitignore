@@ -26,3 +26,7 @@ env/
 .idea/
 .vscode/
 *.swp
+
+# Working notes — session transcripts and chat logs are not part of the skill.
+/chat.md
+/session-*.md

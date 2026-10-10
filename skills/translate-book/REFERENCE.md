@@ -28,10 +28,11 @@ Keep their text, drop the tag. Carrying them through multiplies tokens for no ga
 
 Run per unit, before writing. Reject → keep source text → the cut shows up in verify.
 
-1. No token in the translation that wasn't in the source (no invented tags).
-2. Every token used must be open/close paired.
-3. Atoms: identical multiset, in the translation as in the source.
-4. Exception: allow **fewer** tokens than the source. Source text often splits an
+1. No token in the translation that wasn't in the source; token pairs must remain
+   syntactically nested, not merely balanced.
+2. Every link token, including an empty `<a id=...>` anchor, must survive exactly.
+3. Atoms: identical multiset, including the zero-atom case.
+4. Exception: allow **fewer non-link tokens** than the source. Source text often splits an
    English word across two emphasis spans (`⟧0⟦checkin⟧/0⟦⟧1⟦g⟧/1⟦`); the merged
    Chinese word needs only one. Treating this as a failure rejects correct output.
 
@@ -49,6 +50,8 @@ Every one of these shipped silently at least once. Check for them explicitly.
 | Images vanish from body text | `<img>` inside `<p><strong><img/></strong></p>` treated as a styling wrapper |
 | Garbled strings like `e r t h h e o n i c in g` | Vector-drawn figure text extracted as body prose. Detect: mostly 1–4 char fragments, no long tokens, no code symbols → drop (the figure's raster already carries it) |
 | `&#34;` appears literally in text | Entity decode order wrong. Decode numeric first, named second, `&amp;` **last** |
+| Every non-ASCII character becomes `â€¦` | Charset-less XHTML was parsed through HTML's Latin-1 fallback. Detect an XML/meta declaration; otherwise try UTF-8 before Latin-1. |
+| Equations lose spacing or `mtext` is sent to translators | Treat `<math>` as an atom and skip all of its descendants during unit traversal. |
 | Margin annotations interleaved into one sentence | Line building grouped by vertical position only. Two columns share a baseline — cluster callouts by x-offset first |
 | `high- fidelity`, `breadth- first` | Hyphenated line wrap joined with a space. Only worth fixing if the unit stays untranslated; Chinese drops the hyphen anyway |
 
@@ -60,6 +63,19 @@ Every one of these shipped silently at least once. Check for them explicitly.
 | Translations land on the wrong elements | Extractor and writer enumerate elements by separate logic; any filter difference (no-English, contains-`<pre>`) shifts every index |
 | `<think>` and similar disappear | Escaped text re-parsed as a tag. Escape the literal-text portions of the rendered fragment |
 | `<a>` count doubles | One tag table used for both open and close tags |
+| A batch “passed” but links or atoms were malformed | The worker only checked counts manually. Run `validate-batches` against the plan and extraction metadata before merge. |
+
+### Dispatch and recovery
+
+| Symptom | Cause |
+|---|---|
+| JSON parse error mid-file | JSON was handwritten. Serialize the output object; ordinary straight quotes are valid when escaped by the serializer. |
+| A subtask reports success but wrote no files | Trust `status`, not the report. Batches come from `claim` and land in `done` only through `complete`. |
+| Two workers overwrite each other | Both wrote to `done`. Give each a private run dir and promote atomically. |
+| An aborted worker leaves half-written files | Never share a directory with the next dispatch. Release the dead claim (`claim --release`) and re-dispatch into a fresh run dir. |
+| Terms differ between chapters | No shared glossary. Seed `glossary.json` before dispatching and hand the same file to every worker. |
+| `status` reports `stale` | The plan hash changed — usually a re-extract or re-batch after a fix. `rekey`, then re-dispatch the residue. |
+| The last N batches never ran | Nothing detects it but `status`. Run it before packaging, not after. |
 
 ### Packaging
 
@@ -67,13 +83,7 @@ Every one of these shipped silently at least once. Check for them explicitly.
 |---|---|
 | Second run produces garbage | Builder wrote into the source dir; next extract parsed translated output as English |
 | Reader rejects the file | `mimetype` not first entry, or compressed |
-
-### Translation agents
-
-| Symptom | Cause |
-|---|---|
-| JSON parse error mid-file | Unescaped `"` in Chinese output. Forbid raw straight quotes; require `“ ”` |
-| File missing units | Agent truncated a long batch. Assert unit count and non-empty `out` per file |
+| Image counts look wrong, all zero, or orphans everywhere | Asset dir assumed to be `Images/`. Books use `assets/`, `images/`, or a flat layout — resolve `<img src>` against the referencing page and match by extension. |
 
 ## Reusing translations
 
@@ -83,7 +93,10 @@ unchanged. Match old→new by `raw` text instead of re-translating:
 1. Move the finished batch outputs aside (`translated_prev/`).
 2. Re-extract, re-batch.
 3. Build `{src_text: out}` from the old outputs; write matches into the new ones.
-4. Only the residue goes to subagents.
+4. Only the residue goes to subagents. Keep every worker's files in a separate
+   run directory and validate them before promoting to the combined done directory.
+5. Re-batch afterwards. The new plan gets a new hash, so `status` marks outputs
+   promoted against the old plan as `stale` — that is the point, not a bug.
 
 Match rates above 95% are typical for a fix that touches one rule. Keep the
 reuse output in a **separate directory** from fresh agent output and have the
@@ -152,13 +165,37 @@ references.
 
 Compare against the **source file**, not against expectations.
 
+### Blocking commands
+
+Each must exit 0. Paste them as-is; an open-ended "check the output" is how
+defects reach the reader.
+
+```sh
+# self-test: the writer must reproduce the source before any translation exists
+python3 <skill>/scripts/units.py write $SRC work/units work/trans work/out --identity --strict
+diff -r $SRC work/out
+
+# every planned batch accounted for, none stale
+python3 <skill>/scripts/units.py status work/batches work/done --units-dir work/units
+
+# fixed-size review sample per chapter
+python3 <skill>/scripts/units.py sample work/units work/trans --out work/sample.json
+
+# structure diff against the source book
+python3 <skill>/scripts/epub_verify.py out.epub --source source.epub
+```
+
+### What a human still has to read
+
 - [ ] `mimetype` first, uncompressed; `testzip()` clean
 - [ ] Counts match the source: `<a>`, `<pre>`, `<img>`, table count
 - [ ] Per-chapter translated-unit coverage; list every untranslated unit and
       confirm each is a proper noun, an identifier, or an intentional English
       quotation (model output samples, code listings)
+- [ ] `sample.json` read: every flagged unit is either fixed or explained
 - [ ] Code blocks byte-identical to source lines
-- [ ] No English prose paragraphs surviving in the body
+- [ ] English prose surviving in the body — only as a candidate signal. Read the
+      paragraph; a regex cannot tell a quotation from a missed translation
 - [ ] Every `<img src>` resolves to a packaged file; no orphan images
 - [ ] Spot-read one page of rendered Chinese start to finish
 

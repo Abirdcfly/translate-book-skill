@@ -20,20 +20,49 @@ has thousands of structural dependencies; markdown round-trips break them silent
    directory holding the chapter XHTML (usually `OEBPS/Text/`), and at the
    directory that holds only those files — the tree root will find nothing.
    - Inline markup → `⟧n⟦…⟧/n⟦` tokens (links, emphasis). Inner text **is** translated.
-   - Code/images → `⟨n⟩` atoms. Element preserved verbatim, **never** translated.
+   - Code/images/MathML → `⟨n⟩` atoms. Element preserved verbatim, **never** translated.
    - `<pre>`/`<code>` subtrees are skipped entirely.
-2. **Self-test** — `units.py write --identity`, then diff against the source.
-   Text must match except for intentional normalizations. **Do this before any
-   translation.** It catches every index-alignment bug in minutes.
-3. **Batch** — `units.py batch` into ~1600-word chunks.
-4. **Merge** — `units.py merge` folds finished batch outputs into per-chapter files.
-5. **Write back** — `units.py write`. Validates tokens/atoms per unit and refuses
+2. **Self-test** — `units.py write --identity --strict`, then `diff -r` against
+   the source. Text must match except for intentional normalizations, and the
+   command must exit 0. **Do this before any translation.** It catches every
+   index-alignment bug in minutes.
+3. **Batch** — `units.py batch` into ~1600-word chunks. It writes `_plan.json`
+   carrying a hash of every planned unit; the hash is what later detects outputs
+   produced against an older plan.
+4. **Glossary and register** — `units.py glossary <units>` seeds `glossary.json`
+   from the source (capitalized terms, acronyms, `a.b` symbols). Fill in the
+   empty values, then write the register note once. Both travel with every
+   dispatch; without them parallel batches invent competing terms.
+5. **Dispatch** — `units.py claim <batches> <done> --worker ID` prints the next
+   unclaimed batch files. A worker writes into **its own run directory**, never
+   into `done`.
+6. **Promote** — `units.py complete <batches> <run_dir> <done> --units-dir <units>`
+   validates the run directory and atomically copies only the files that pass.
+   A worker's own "done" report is not evidence.
+7. **Merge** — `units.py merge <units> <done> <trans> --batches-dir <batches>`
+   refuses an incomplete plan by default; use `--allow-incomplete` only for an
+   explicitly approved partial delivery.
+8. **Write back** — `units.py write`. Validates tokens/atoms per unit and refuses
    to write a unit that fails.
-6. **Package** — `epub_build.py`.
-7. **Verify** — `epub_verify.py`, diffing element counts against the source.
+9. **Package** — `epub_build.py`.
+10. **Verify** — `epub_verify.py`, diffing element counts against the source.
+11. **Sample** — `units.py sample <units> <trans> --out sample.json` draws a fixed
+    review sample per chapter (long prose, headings, cross-references, units with
+    tokens or atoms) and flags empty, untranslated, and marker-damaged units.
 
-Re-run steps 5–7 freely. Re-running 1 is expensive once translations exist — see
+Re-run steps 8–11 freely. Re-running 1 is expensive once translations exist — see
 *Reusing translations* in [REFERENCE.md](REFERENCE.md).
+
+## Interrupted runs
+
+`units.py status <batches> <done> --units-dir <units>` is the only source of
+truth: `planned/complete/missing/invalid/claimed/stale`. Recover in this order:
+
+- `missing` — re-claim those batches and re-dispatch: `units.py claim ... `
+- `invalid` — the file exists but fails validation; re-dispatch it, do not edit it.
+- `claimed` but the worker died — `units.py claim --worker ID --release <dead worker>`.
+- `stale` — the plan changed since those outputs were promoted; `rekey` first,
+  then re-dispatch the residue.
 
 ## Non-negotiables
 
@@ -45,8 +74,17 @@ Re-run steps 5–7 freely. Re-running 1 is expensive once translations exist —
 - **Materialize the element list before mutating the tree.** lxml iterators skip
   elements when children change mid-iteration — you get one paragraph per chapter.
 - **Code is never translated.** Prose wrapped around inline code is.
+- **MathML is never translated.** Inline equations are atoms; their surrounding
+  prose remains a unit.
 - **Validate before writing, never after.** Failed units keep their source text.
-  A missing translation beats corrupted markup, and it shows up in verification.
+  Batch validation and merge must stop before a missing translation can become a
+  finished EPUB.
+- **A worker's self-report is not a merge gate.** Only `validate-batches` /
+  `complete` decide. Sessions that trusted the report shipped books with whole
+  batches still in English.
+- **One worker, one directory.** Workers write to private run directories;
+  promotion is a separate, atomic step. Two workers sharing `done` overwrite
+  each other's half-finished files.
 
 ## Knowing when the source is lying
 
@@ -63,18 +101,20 @@ font→role table, then extract. Recipe and pitfalls: [REFERENCE.md](REFERENCE.m
 
 ## Delegating translation
 
-Use [AGENTS.md](AGENTS.md) as the prompt template. The token/atom rules and the
-JSON-escaping rule matter more than style guidance — a subagent that mangles a
-token corrupts the book, and one that emits a raw `"` corrupts the file.
+Use [AGENTS.md](AGENTS.md) as the prompt template. Give each worker a private
+run directory, take its file list from `units.py claim`, and promote it with
+`units.py complete`. The token/atom rules matter more than style guidance — a
+subagent that mangles a token corrupts the book.
 
 Two subagents at a time is the usual ceiling. Group batches by chapter so
-terminology stays consistent within a run.
+terminology stays consistent within a run, and hand every worker the same
+`glossary.json` and register note — terminology cannot be re-derived per batch.
 
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `scripts/units.py` | extract / write / batch / merge / rekey |
+| `scripts/units.py` | extract / write / batch / glossary / claim / validate-batches / complete / status / merge / sample / rekey |
 | `scripts/pdf_layout.py` | PDF → structured document (coordinates + fonts) |
 | `scripts/epub_build.py` | stage + package a valid EPUB |
 | `scripts/epub_verify.py` | integrity, coverage, structure diff |
