@@ -71,6 +71,7 @@ TAGNAME_RE = re.compile(r"<([A-Za-z][\w:.-]*)")
 TOKEN_SPLIT = re.compile(r"(⟧/?\d+⟦|⟨\d+⟩)")
 MARKER_RE = re.compile(r"⟧(?P<close>/)?(?P<index>\d+)⟦")
 MALFORMED_MARKER_RE = re.compile(r"(?:⟦/?\d+⟦|⟦/?\d+⟧|⟧/?\d+⟧)")
+MARKER_GLYPHS = frozenset("⟦⟧⟨⟩")
 
 # Kept only where a citation would otherwise be re-derived wrongly.
 CITATION_RE = re.compile(r"^\[[\d,\s–-]+\]$")
@@ -298,6 +299,14 @@ def validate(template, translated, tags=None, check_atoms=True):
         translated_atoms = Counter(ATOM_RE.findall(translated))
         if source_atoms != translated_atoms:
             return f"atom mismatch: source={sorted(source_atoms.elements())} translation={sorted(translated_atoms.elements())}"
+    # A marker glyph surviving outside a token/atom passes every pairing check
+    # above but renders as a visible bracket in the book. Glyphs the source
+    # itself carries outside tokens are not the translator's doing — the
+    # identity self-test must still pass on them.
+    stray = set(TOKEN_SPLIT.sub("", translated)) & MARKER_GLYPHS
+    stray -= set(TOKEN_SPLIT.sub("", template)) & MARKER_GLYPHS
+    if stray:
+        return f"stray marker outside tokens: {sorted(stray)[0]!r}"
     return None
 
 

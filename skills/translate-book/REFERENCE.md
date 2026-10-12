@@ -35,6 +35,10 @@ Run per unit, before writing. Reject → keep source text → the cut shows up i
 4. Exception: allow **fewer non-link tokens** than the source. Source text often splits an
    English word across two emphasis spans (`⟧0⟦checkin⟧/0⟦⟧1⟦g⟧/1⟦`); the merged
    Chinese word needs only one. Treating this as a failure rejects correct output.
+5. No marker glyph (`⟦ ⟧ ⟨ ⟩`) outside a well-formed token or atom. Pairing checks
+   cannot see a lone `⟧` typed into a footnote ref — it just prints as a bracket.
+   Glyphs the source itself carries outside tokens are exempt, so the identity
+   self-test still passes.
 
 Record genuine source defects in an exceptions file rather than loosening rules 1–3.
 
@@ -63,6 +67,7 @@ Every one of these shipped silently at least once. Check for them explicitly.
 | Translations land on the wrong elements | Extractor and writer enumerate elements by separate logic; any filter difference (no-English, contains-`<pre>`) shifts every index |
 | `<think>` and similar disappear | Escaped text re-parsed as a tag. Escape the literal-text portions of the rendered fragment |
 | `<a>` count doubles | One tag table used for both open and close tags |
+| A stray `⟧` or `⟨` prints inside a translated sentence | Glyph typed into prose without its partner. Pairing and atom checks both pass — the rule is "no marker glyph outside a token/atom". |
 | A batch “passed” but links or atoms were malformed | The worker only checked counts manually. Run `validate-batches` against the plan and extraction metadata before merge. |
 
 ### Dispatch and recovery

@@ -173,6 +173,54 @@ class TranslateBookRegressionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("malformed marker", result.stdout)
 
+    def test_validate_batches_rejects_a_stray_marker_glyph(self):
+        """A lone ⟧ typed into prose is not an omission — it renders in the book."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            batches = root / "batches"
+            done = root / "done"
+            batches.mkdir(); done.mkdir()
+            batch = {
+                "file": "chapter.xhtml", "batch": 0,
+                "units": [{"key": "0.text", "src": "See the note."}],
+            }
+            (batches / "chapter-b00.json").write_text(json.dumps(batch), encoding="utf-8")
+            (batches / "_plan.json").write_text(
+                json.dumps([{"file": "chapter-b00.json", "batch": 0, "units": 1, "words": 3}]),
+                encoding="utf-8",
+            )
+            stray = {**batch, "units": [{**batch["units"][0], "out": "参见注释⟧。"}]}
+            (done / "chapter-b00.json").write_text(json.dumps(stray), encoding="utf-8")
+
+            result = run(UNITS, "validate-batches", batches, done)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stray marker outside tokens", result.stdout)
+
+            fixed = {**batch, "units": [{**batch["units"][0], "out": "参见注释。"}]}
+            (done / "chapter-b00.json").write_text(json.dumps(fixed), encoding="utf-8")
+            result = run(UNITS, "validate-batches", batches, done)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_identity_tolerates_marker_glyphs_the_source_carries(self):
+        """The stray-marker rule must not fail the self-test on the source's own glyphs."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            units = root / "units"
+            output = root / "output"
+            source.mkdir()
+            (source / "chapter.xhtml").write_text(
+                '<html><body><p>The set is written ⟧ in the source text.</p></body></html>',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run(UNITS, "extract", source, units).returncode, 0)
+            result = run(UNITS, "write", source, units, units, output, "--identity", "--strict")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("⟧ in the source", (output / "chapter.xhtml").read_text("utf-8"))
+
     def test_flat_overlay_replaces_a_chapter_directly_under_oebps(self):
         """A flat writer output must replace OEBPS/chapter.xhtml, not create a root copy."""
         spec = importlib.util.spec_from_file_location("epub_build", SCRIPTS / "epub_build.py")

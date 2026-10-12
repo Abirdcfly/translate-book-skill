@@ -99,8 +99,9 @@ output verbatim:
     python3 <skill>/scripts/units.py validate-batches <batches_dir> <run_dir> \
       --units-dir <units_dir> --files <file1> <file2>
 
-It checks identity, non-empty output, marker syntax/nesting, atoms, and link
-anchors. Your files are promoted with `complete`, which re-runs this check —
+It checks identity, non-empty output, marker syntax/nesting, stray marker
+glyphs, atoms, and link anchors. Your files are promoted with `complete`, which
+re-runs this check —
 a batch that fails is not merged, so fix it here rather than reporting around it.
 Do not claim “no English prose” from a regex; flag retained English for human
 review when it is not code, an identifier, a name, a quotation, or a title.
